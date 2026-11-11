@@ -33,6 +33,40 @@ jobs:
           sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 24/' android/app/build.gradle 2>/dev/null || true
           cp proguard-rules.pro android/app/proguard-rules.pro
 
+      - name: Receber prints pelo menu Compartilhar
+        run: |
+          if [ -f MainActivity.kt ]; then
+            find android/app/src/main -name 'MainActivity.*' -delete
+            mkdir -p android/app/src/main/kotlin/com/deividi/protocolos
+            cp MainActivity.kt android/app/src/main/kotlin/com/deividi/protocolos/MainActivity.kt
+            python3 - <<'EOF'
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p).read()
+          s = s.replace('android:launchMode="singleTop"', 'android:launchMode="singleTask"')
+          filtros = '''
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND"/>
+                          <category android:name="android.intent.category.DEFAULT"/>
+                          <data android:mimeType="image/*"/>
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND_MULTIPLE"/>
+                          <category android:name="android.intent.category.DEFAULT"/>
+                          <data android:mimeType="image/*"/>
+                      </intent-filter>
+                  </activity>'''
+          s = s.replace('</activity>', filtros, 1)
+          open(p, 'w').write(s)
+          EOF
+          fi
+
+      - name: Usar sempre a mesma assinatura (para atualizar sem desinstalar)
+        run: |
+          if [ -f debug.keystore ]; then
+            mkdir -p ~/.android
+            cp debug.keystore ~/.android/debug.keystore
+          fi
+
       - run: flutter pub get
 
       - run: flutter build apk --release
