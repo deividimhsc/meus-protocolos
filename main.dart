@@ -363,7 +363,28 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    // prints compartilhados de outro app (ex.: Voalle → Compartilhar → Meus Protocolos)
+    _share.setMethodCallHandler((call) async {
+      if (call.method == 'shared') await _checkShared();
+      return null;
+    });
     _load();
+  }
+
+  static const _share = MethodChannel('protocolos/share');
+
+  Future<void> _checkShared() async {
+    if (prefs == null || reading) return;
+    List<String> paths;
+    try {
+      final r = await _share.invokeMethod<List<dynamic>>('getShared');
+      paths = (r ?? const []).map((e) => '$e').toList();
+    } catch (_) {
+      return;
+    }
+    if (paths.isEmpty || !mounted) return;
+    setState(() => tab = 0);
+    await _processShots(paths);
   }
 
   @override
@@ -390,6 +411,7 @@ class _HomePageState extends State<HomePage> {
       upCtl.text = num2(upValue);
       goalCtl.text = goal > 0 ? num2(goal) : '0';
     });
+    _checkShared();
   }
 
   Future<void> _persist() async {
@@ -480,11 +502,15 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     if (files.isEmpty || !mounted) return;
+    await _processShots(files.map((f) => f.path).toList());
+  }
+
+  Future<void> _processShots(List<String> paths) async {
     setState(() => reading = true);
     final results = <ShotResult>[];
     try {
-      for (final f in files) {
-        results.add(await readShot(f.path));
+      for (final path in paths) {
+        results.add(await readShot(path));
       }
     } catch (e) {
       if (mounted) _snack('Não consegui ler o print: $e');
