@@ -1,0 +1,20 @@
+name: protocolos
+description: Contador de protocolos e UPs com leitura de print.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.4.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  # "any" = usa a versão mais nova compatível com o seu Flutter
+  image_picker: any
+  shared_preferences: any
+  google_mlkit_text_recognition: any
+
+flutter:
+  uses-material-design: true
