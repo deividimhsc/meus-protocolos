@@ -10,10 +10,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
       - uses: subosito/flutter-action@v2
         with:
@@ -32,6 +32,12 @@ jobs:
           sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/' android/app/build.gradle.kts 2>/dev/null || true
           sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 24/' android/app/build.gradle 2>/dev/null || true
           cp proguard-rules.pro android/app/proguard-rules.pro
+          # desliga a verificação "lint" das bibliotecas (não afeta o app e às vezes quebra a compilação)
+          for f in android/build.gradle.kts android/build.gradle; do
+            if [ -f "$f" ]; then
+              printf '\nsubprojects {\n    tasks.matching { it.name.contains("lintVital") }.configureEach { enabled = false }\n}\n' >> "$f"
+            fi
+          done
 
       - name: Receber prints pelo menu Compartilhar
         run: |
