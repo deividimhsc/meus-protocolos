@@ -129,6 +129,12 @@ const typeAliases = <String, List<String>>{
   'recolhimento integral': ['retint'],
   'recolhimento parcial': ['retpar'],
   'retirada': ['retint', 'retpar'],
+  // nomes que aparecem no CSV do Elleven
+  'atendimento corporativo': ['atdc'],
+  'instalacao de cameras': ['cam'],
+  'atendimento tecnico mh play streaming': ['mhplay'],
+  'mh play streaming': ['mhplay'],
+  'upgrade': ['upg'],
 };
 final List<String> _aliasKeys = typeAliases.keys.toList()
   ..sort((a, b) => b.length.compareTo(a.length));
@@ -313,6 +319,69 @@ ShotResult parseVoalle(String text) {
   return r;
 }
 
+// ───────────────────────── CSV do Elleven ─────────────────────────
+class ImportRow {
+  final String p;
+  final String rawType;
+  final String key;
+  final DateTime? closed;
+  final DateTime? opened;
+  ImportRow(this.p, this.rawType, this.closed, this.opened) : key = norm(rawType);
+}
+
+List<String> splitCsv(String line, String delim) {
+  final out = <String>[];
+  final sb = StringBuffer();
+  var inQ = false;
+  for (var i = 0; i < line.length; i++) {
+    final ch = line[i];
+    if (ch == '"') {
+      if (inQ && i + 1 < line.length && line[i + 1] == '"') {
+        sb.write('"');
+        i++;
+      } else {
+        inQ = !inQ;
+      }
+    } else if (ch == delim && !inQ) {
+      out.add(sb.toString());
+      sb.clear();
+    } else {
+      sb.write(ch);
+    }
+  }
+  out.add(sb.toString());
+  return out;
+}
+
+/// Lê a "Listagem de Solicitações" do Elleven. Devolve null se o texto não tiver esse formato.
+List<ImportRow>? parseElleven(String text) {
+  final lines = text.replaceAll('\ufeff', '').split(RegExp(r'\r?\n')).where((l) => l.trim().isNotEmpty).toList();
+  final hi = lines.indexWhere((l) {
+    final n = norm(l);
+    return n.contains('protocolo') && n.contains('tipo de solicitacao');
+  });
+  if (hi < 0) return null;
+  final hl = lines[hi];
+  final delim = ';'.allMatches(hl).length >= ','.allMatches(hl).length ? ';' : ',';
+  final head = splitCsv(hl, delim).map(norm).toList();
+  final cP = head.indexWhere((h) => h == 'protocolo');
+  final cT = head.indexWhere((h) => h.startsWith('tipo de solicitacao'));
+  final cE = head.indexWhere((h) => h.contains('encerramento'));
+  final cA = head.indexWhere((h) => h.contains('abertura'));
+  if (cP < 0 || cT < 0) return null;
+  final rows = <ImportRow>[];
+  for (final l in lines.skip(hi + 1)) {
+    final f = splitCsv(l, delim);
+    String at(int i) => (i >= 0 && i < f.length) ? f[i].trim() : '';
+    final p = at(cP).replaceAll(RegExp(r'\D'), '');
+    if (p.isEmpty) continue;
+    rows.add(ImportRow(p, at(cT), cE >= 0 ? parseDate(at(cE)) : null, cA >= 0 ? parseDate(at(cA)) : null));
+  }
+  return rows;
+}
+
+String shortType(String raw) => raw.replaceFirst(RegExp(r'^O&M\s*-?\s*'), '');
+
 // ───────────────────────── app ─────────────────────────
 class App extends StatelessWidget {
   const App({super.key});
@@ -382,9 +451,97 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {
       return;
     }
-    if (paths.isEmpty || !mounted) return;
-    setState(() => tab = 0);
-    await _processShots(paths);
+    if (paths.isNotEmpty && mounted) {
+      setState(() => tab = 0);
+      await _processShots(paths);
+    }
+    List<String> csvs;
+    try {
+      final r = await _share.invokeMethod<List<dynamic>>('getSharedCsv');
+      csvs = (r ?? const []).map((e) => '$e').toList();
+    } catch (_) {
+      return;
+    }
+    for (final t in csvs) {
+      if (!mounted) return;
+      await _importCsvText(t);
+    }
+  }
+
+  Map<String, String> _loadTypeMap() {
+    try {
+      final raw = prefs?.getString('typeMap');
+      if (raw == null) return {};
+      return Map<String, String>.from(jsonDecode(raw) as Map);
+    } catch (_) {
+      return {};
+    }
+  }
+
+  Future<void> _pickCsvFile() async {
+    String? text;
+    try {
+      text = await _share.invokeMethod<String>('pickCsv');
+    } catch (e) {
+      _snack('Não consegui abrir o arquivo: $e');
+      return;
+    }
+    if (text == null || !mounted) return;
+    await _importCsvText(text);
+  }
+
+  Future<void> _importCsvText(String text) async {
+    final rows = parseElleven(text);
+    if (rows == null) {
+      await _importGeneric(text);
+      return;
+    }
+    if (rows.isEmpty) {
+      _snack('Nenhum protocolo encontrado no arquivo');
+      return;
+    }
+    final res = await Navigator.push<ImportDecision>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ImportPage(
+          rows: rows,
+          existing: items.keys.toSet(),
+          upValue: upValue,
+          savedMap: _loadTypeMap(),
+        ),
+      ),
+    );
+    if (res == null || !mounted) return;
+    final map = _loadTypeMap()..addAll(res.mapping);
+    await prefs?.setString('typeMap', jsonEncode(map));
+    if (res.protos.isEmpty) {
+      _snack('Nada para importar');
+      return;
+    }
+    final before = <String, Proto?>{for (final p in res.protos) p.p: items[p.p]};
+    var latest = res.protos.first;
+    setState(() {
+      for (final p in res.protos) {
+        items[p.p] = p;
+        if (p.ts > latest.ts) latest = p;
+      }
+      month = DateTime(latest.date.year, latest.date.month);
+      tab = 0;
+    });
+    await _persist();
+    final total = res.protos.fold<double>(0, (s, p) => s + valOf(p));
+    _snack('${res.protos.length} protocolo(s) importados · ${brl(total)}', undo: () {
+      setState(() {
+        before.forEach((k, old) {
+          if (old == null) {
+            items.remove(k);
+          } else {
+            items[k] = old;
+          }
+        });
+      });
+      _persist();
+    });
   }
 
   @override
@@ -624,11 +781,20 @@ class _HomePageState extends State<HomePage> {
   Widget _top() {
     final n = DateTime.now();
     return Padding(
-      padding: const EdgeInsets.fromLTRB(2, 8, 2, 14),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const Text('Meus Protocolos', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
-        Text('${weekLong[n.weekday % 7]}, ${n.day} de ${monthNames[n.month - 1].toLowerCase()}',
-            style: const TextStyle(color: kMuted, fontSize: 13)),
+      padding: const EdgeInsets.fromLTRB(2, 8, 0, 14),
+      child: Row(children: [
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Meus Protocolos', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+            Text('${weekLong[n.weekday % 7]}, ${n.day} de ${monthNames[n.month - 1].toLowerCase()}',
+                style: const TextStyle(color: kMuted, fontSize: 13)),
+          ]),
+        ),
+        IconButton(
+          tooltip: 'Importar CSV do Elleven',
+          onPressed: _pickCsvFile,
+          icon: const Icon(Icons.upload_file, color: kMuted),
+        ),
       ]),
     );
   }
@@ -1099,6 +1265,7 @@ class _HomePageState extends State<HomePage> {
       _section(
         'Backup',
         Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          _btn('📂  Importar arquivo do Elleven (CSV)', _pickCsvFile),
           _btn('📋  Copiar CSV do mês', _copyCsv),
           _btn('📥  Colar / importar CSV', _importDialog),
           _btn('🗑️  Apagar protocolos do mês', _wipeMonth, danger: true),
@@ -1170,9 +1337,13 @@ class _HomePageState extends State<HomePage> {
       ),
     );
     if (ok != true) return;
+    await _importCsvText(ctl.text);
+  }
+
+  Future<void> _importGeneric(String text) async {
     var n = 0;
     var skip = 0;
-    for (final line in ctl.text.split(RegExp(r'\r?\n'))) {
+    for (final line in text.split(RegExp(r'\r?\n'))) {
       final l = line.trim();
       if (l.isEmpty) continue;
       final parts = l.split(RegExp(r'[;,\t]')).map((s) => s.trim().replaceAll('"', '')).toList();
@@ -1578,6 +1749,291 @@ class _AddSheetState extends State<AddSheet> {
             ),
           ),
         ]),
+      ),
+    );
+  }
+}
+
+// ───────────────────────── tela de importação do Elleven ─────────────────────────
+class ImportDecision {
+  final List<Proto> protos;
+  final Map<String, String> mapping;
+  ImportDecision(this.protos, this.mapping);
+}
+
+class ImportPage extends StatefulWidget {
+  final List<ImportRow> rows;
+  final Set<String> existing;
+  final double upValue;
+  final Map<String, String> savedMap;
+  const ImportPage({
+    super.key,
+    required this.rows,
+    required this.existing,
+    required this.upValue,
+    required this.savedMap,
+  });
+
+  @override
+  State<ImportPage> createState() => _ImportPageState();
+}
+
+class _ImportPageState extends State<ImportPage> {
+  final Map<String, String?> choice = {}; // tipo do Elleven → id do app, 'skip' ou null (falta escolher)
+  final Map<String, String> rawOf = {};
+  final Map<String, int> countOf = {};
+  bool onlyClosed = true;
+  bool overwrite = false;
+
+  @override
+  void initState() {
+    super.initState();
+    for (final r in widget.rows) {
+      rawOf.putIfAbsent(r.key, () => r.rawType);
+      countOf[r.key] = (countOf[r.key] ?? 0) + 1;
+    }
+    for (final k in rawOf.keys) {
+      final saved = widget.savedMap[k];
+      if (saved != null && (saved == 'skip' || typeById.containsKey(saved))) {
+        choice[k] = saved;
+      } else {
+        final ids = matchType(rawOf[k]!);
+        choice[k] = ids.length == 1 ? ids.first : null;
+      }
+    }
+  }
+
+  Future<void> _choose(String k) async {
+    final sel = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: kCard,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(26))),
+      builder: (ctx) => ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: MediaQuery.of(ctx).size.height * 0.85),
+        child: ListView(shrinkWrap: true, padding: const EdgeInsets.fromLTRB(16, 16, 16, 24), children: [
+          Text(shortType(rawOf[k]!), style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 4),
+          const Text('Qual tipo da tabela de UPs é esse?', style: TextStyle(color: kMuted)),
+          const SizedBox(height: 12),
+          ListTile(
+            leading: const Icon(Icons.block, color: Color(0xFFFCA5A5)),
+            title: const Text('Não contar (ignorar esse tipo)'),
+            onTap: () => Navigator.pop(ctx, 'skip'),
+          ),
+          for (final c in cats) ...[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(4, 12, 4, 4),
+              child: Text('${c.emoji} ${c.name.toUpperCase()}',
+                  style: TextStyle(color: c.color, fontWeight: FontWeight.w800, fontSize: 12)),
+            ),
+            for (final t in types.where((t) => t.cat == c.id))
+              ListTile(
+                dense: true,
+                selected: choice[k] == t.id,
+                title: Text(t.name),
+                trailing: Text('${num2(t.up)} UP', style: const TextStyle(color: kMuted)),
+                onTap: () => Navigator.pop(ctx, t.id),
+              ),
+          ],
+        ]),
+      ),
+    );
+    if (sel != null) setState(() => choice[k] = sel);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final out = <String, Proto>{};
+    var existingSkip = 0, openSkip = 0, ignored = 0, missing = 0;
+    for (final r in widget.rows) {
+      final c = choice[r.key];
+      if (c == null) {
+        missing++;
+        continue;
+      }
+      if (c == 'skip') {
+        ignored++;
+        continue;
+      }
+      final d = onlyClosed ? r.closed : (r.closed ?? r.opened);
+      if (d == null) {
+        openSkip++;
+        continue;
+      }
+      if (!overwrite && widget.existing.contains(r.p)) {
+        existingSkip++;
+        continue;
+      }
+      final t = typeById[c]!;
+      out[r.p] = Proto(r.p, t.id, t.up, d.millisecondsSinceEpoch);
+    }
+    final protos = out.values.toList();
+    final total = protos.fold<double>(0, (s, p) => s + p.up * widget.upValue);
+
+    // resumo por mês
+    final byMonth = <String, List<double>>{};
+    for (final p in protos) {
+      final k = '${p.date.year}-${two(p.date.month)}';
+      final e = byMonth.putIfAbsent(k, () => [0.0, 0.0]);
+      e[0] += 1;
+      e[1] += p.up * widget.upValue;
+    }
+    final months = byMonth.keys.toList()..sort((a, b) => b.compareTo(a));
+
+    final keys = rawOf.keys.toList()
+      ..sort((a, b) {
+        final ua = choice[a] == null ? 0 : 1, ub = choice[b] == null ? 0 : 1;
+        if (ua != ub) return ua.compareTo(ub);
+        return (countOf[b] ?? 0).compareTo(countOf[a] ?? 0);
+      });
+
+    final notes = <String>[
+      if (existingSkip > 0) '$existingSkip já estavam no app (pulados)',
+      if (openSkip > 0) '$openSkip ainda não encerrados (pulados)',
+      if (ignored > 0) '$ignored de tipos ignorados',
+      if (missing > 0) '$missing de tipos sem escolha (pulados)',
+    ];
+
+    return Scaffold(
+      appBar: AppBar(backgroundColor: kBg, title: const Text('Importar do Elleven')),
+      body: ListView(padding: const EdgeInsets.fromLTRB(16, 4, 16, 24), children: [
+        Container(
+          padding: const EdgeInsets.all(18),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(22),
+            gradient: const LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [Color(0xFF059669), Color(0xFF0891B2), Color(0xFF2563EB)],
+            ),
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('${widget.rows.length} protocolos no arquivo', style: const TextStyle(color: Colors.white)),
+            const SizedBox(height: 6),
+            Text('${protos.length} para importar',
+                style: const TextStyle(color: Colors.white, fontSize: 26, fontWeight: FontWeight.w800)),
+            Text(brl(total), style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700)),
+            for (final m in months)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  '${monthNames[int.parse(m.substring(5)) - 1]} ${m.substring(0, 4)}: '
+                  '${byMonth[m]![0].round()} · ${brl(byMonth[m]![1])}',
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                ),
+              ),
+          ]),
+        ),
+        if (notes.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(4, 10, 4, 0),
+            child: Text(notes.join('  ·  '), style: const TextStyle(color: kMuted, fontSize: 12)),
+          ),
+        const SizedBox(height: 8),
+        SwitchListTile(
+          contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+          value: onlyClosed,
+          onChanged: (v) => setState(() => onlyClosed = v),
+          title: const Text('Só protocolos encerrados'),
+          subtitle: const Text('Usa a data do encerramento', style: TextStyle(color: kMuted, fontSize: 12)),
+        ),
+        SwitchListTile(
+          contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+          value: overwrite,
+          onChanged: (v) => setState(() => overwrite = v),
+          title: const Text('Substituir os que já existem'),
+          subtitle: const Text('Desligado: mantém o que você já lançou', style: TextStyle(color: kMuted, fontSize: 12)),
+        ),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(4, 14, 4, 8),
+          child: Text('TIPOS ENCONTRADOS',
+              style: TextStyle(fontSize: 12, color: kMuted, fontWeight: FontWeight.w600, letterSpacing: .6)),
+        ),
+        for (final k in keys) _groupTile(k),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(4, 6, 4, 0),
+          child: Text('Toque num tipo para trocar. O app lembra suas escolhas na próxima importação.',
+              style: TextStyle(color: kMuted, fontSize: 12)),
+        ),
+      ]),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+          child: SizedBox(
+            height: 54,
+            child: FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: kAcc1,
+                foregroundColor: kDark,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              ),
+              onPressed: () {
+                final mapping = <String, String>{};
+                choice.forEach((k, v) {
+                  if (v != null) mapping[k] = v;
+                });
+                Navigator.pop(context, ImportDecision(protos, mapping));
+              },
+              child: Text(
+                protos.isEmpty ? 'Salvar escolhas' : 'Importar ${protos.length} protocolos',
+                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _groupTile(String k) {
+    final c = choice[k];
+    final missing = c == null;
+    final t = (c == null || c == 'skip') ? null : typeById[c];
+    final cat = t == null ? null : catById[t.cat];
+    final sub = missing
+        ? 'Toque para escolher o tipo'
+        : c == 'skip'
+            ? 'Não conta UP (ignorado)'
+            : '→ ${t!.name} · ${num2(t.up)} UP';
+    final shape = RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(16),
+      side: BorderSide(color: missing ? kWarn : Colors.transparent, width: 1.5),
+    );
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Material(
+        color: kCard,
+        shape: shape,
+        child: InkWell(
+          customBorder: shape,
+          onTap: () => _choose(k),
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Row(children: [
+              cat != null
+                  ? catIcon(cat, 38)
+                  : Container(
+                      width: 38,
+                      height: 38,
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(color: kCard2, borderRadius: BorderRadius.circular(13)),
+                      child: Text(missing ? '❓' : '🚫', style: const TextStyle(fontSize: 17)),
+                    ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(shortType(rawOf[k]!), style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14)),
+                  const SizedBox(height: 2),
+                  Text(sub, style: TextStyle(color: missing ? kWarn : kMuted, fontSize: 12)),
+                ]),
+              ),
+              Text('${countOf[k]}×', style: const TextStyle(fontWeight: FontWeight.w800)),
+              const Icon(Icons.chevron_right, color: kMuted),
+            ]),
+          ),
+        ),
       ),
     );
   }
